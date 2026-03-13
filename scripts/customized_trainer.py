@@ -14,7 +14,7 @@ from transformers.trainer_utils import is_main_process
 import wandb
 import torch
 from state_manager import get_state, set_state
-MAX_TRIES = 9
+MAX_TRIES = 25
 
 
 MIS_MATCH_VOCAB_SIZE_MODELS = [

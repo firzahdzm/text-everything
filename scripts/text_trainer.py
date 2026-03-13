@@ -437,7 +437,7 @@ def main():
                     print(f"[Adaptive] Early stop saved {saved} steps, "
                           f"total saved: {state['saved_steps']}/{checking_step}", flush=True)
 
-                if state.get("saved_steps", 0) >= checking_step and n_runs < 9:
+                if state.get("saved_steps", 0) >= checking_step and n_runs < 25:
                     state["next_runs"] += 1
                     n_runs = state["next_runs"]
                     state["saved_steps"] -= checking_step
