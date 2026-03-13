@@ -447,6 +447,36 @@ def main():
                 set_state(state)
                 state["runs"].append(state["train"].copy())
                 delete_poor_checkpoints(state["runs"])
+
+                # Adaptive exploration: if early-stopped runs saved time,
+                # use that budget for extra LR candidates
+                checking_step = c_train_info["train_request"].get("checking_step", 70)
+                last_run = state["runs"][-1]
+                if "stopped_at_step" in last_run:
+                    saved = checking_step - last_run["stopped_at_step"]
+                    state["saved_steps"] = state.get("saved_steps", 0) + saved
+                    print(f"[Adaptive] Early stop saved {saved} steps, "
+                          f"total saved: {state['saved_steps']}/{checking_step}", flush=True)
+
+                if state.get("saved_steps", 0) >= checking_step and n_runs < 9:
+                    # Enough time saved for 1 extra run — generate new LR candidate
+                    import math
+                    PHI = (1 + math.sqrt(5)) / 2
+                    log_range = get_log_scale(args.task_type)
+                    new_idx = len(state["lrs"])
+                    cycle = (new_idx - 1) // 2
+                    sign = 1 if new_idx % 2 == 1 else -1
+                    step = log_range / (PHI ** cycle)
+                    found_lr = state["train"].get("found_lr")
+                    base_lr = float(found_lr if found_lr is not None else state["train"]["lr"])
+                    new_lr = base_lr * (10 ** (sign * step))
+                    state["lrs"].append(new_lr)
+                    state["next_runs"] += 1
+                    n_runs = state["next_runs"]
+                    state["saved_steps"] -= checking_step
+                    print(f"[Adaptive] Added extra LR candidate: {new_lr:.4e} "
+                          f"(total runs now: {n_runs})", flush=True)
+
                 if len(state["runs"]) < n_runs:
                     index = len(state["runs"])
                     current_lr = state["lrs"][index]

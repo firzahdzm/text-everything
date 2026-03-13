@@ -162,6 +162,7 @@ class CustomEvalSaveCallback(TrainerCallback):
                           f"best {current_min_loss:.4f} x {EARLY_STOP_THRESHOLD} = "
                           f"{current_min_loss * EARLY_STOP_THRESHOLD:.4f}. Stopping early.", flush=True)
                     my_state["train"]["current_loss"] = current_loss
+                    my_state["train"]["stopped_at_step"] = state.global_step
                     control.should_training_stop = True
                     control.should_save = False
                     args.save_strategy = "no"
