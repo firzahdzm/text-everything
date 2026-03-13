@@ -1,0 +1,504 @@
+from typing import Dict, Optional
+import requests
+import json
+import random
+import utility
+from datasets import Dataset
+from utility import log_info
+from transformers import AutoTokenizer, BitsAndBytesConfig
+from transformers.trainer_utils import get_last_checkpoint
+import transformers
+import torch
+from transformers.trainer_utils import is_main_process
+from dataclasses import dataclass, field
+from transformers import Trainer, TrainingArguments as HFTrainingArguments
+from trl import DPOTrainer, DPOConfig, ModelConfig, ScriptArguments, TrlParser
+from trl import get_kbit_device_map, get_peft_config, get_quantization_config
+from peft import (
+    LoraConfig,
+    PeftModel,
+    get_peft_model,
+    prepare_model_for_kbit_training,
+    PeftModelForCausalLM,
+    AutoPeftModelForCausalLM,
+)
+from transformers import TrainerCallback
+import argparse
+import os
+from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, WhenToEvalHandler, init_wandb
+from state_manager import get_state, set_state
+from lr_finder_les import find_lr_and_continue
+from config_pair import DPO_CONFIG_RATIO
+
+# from packing.packed_dataset import PackedDataset
+from transformers import (
+    Trainer,
+    TrainingArguments,
+    TrainerCallback,
+    TrainerState,
+    TrainerControl,
+)
+import os
+import datetime
+import shutil
+from huggingface_hub import HfApi
+from typing import Callable, Optional
+import bitsandbytes as bnb
+import yaml
+from tokenize_dpo import get_dataset
+from transformers.modeling_utils import is_deepspeed_zero3_enabled
+
+
+
+LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
+torch.cuda.set_device(LOCAL_RANK)
+
+
+@dataclass
+class TrainingArguments(DPOConfig):
+    request_path: Optional[str] = field(default=None)
+    use_liger: Optional[bool] = field(default=False)
+    disable_fa: Optional[bool] = field(default=False)
+    use_attn_implementation: Optional[str] = field(default="")
+
+
+def find_all_linear_names(model):
+    lora_module_names = set()
+    for name, module in model.named_modules():
+        if isinstance(module, bnb.nn.Linear4bit) or isinstance(module, torch.nn.Linear):
+            names = name.split(".")
+            lora_module_names.add(names[0] if len(names) == 1 else names[-1])
+
+    if "lm_head" in lora_module_names:  # needed for 16-bit
+        lora_module_names.remove("lm_head")
+    return list(lora_module_names)
+
+
+def print_trainable_parameters(model):
+    """
+    Prints the number of trainable parameters in the model.
+    """
+    lora_param_count = 0
+    all_param = 0
+    embedding_lm_head_param_count = 0
+    for name, param in model.named_parameters():
+        num_params = param.numel()
+        # if using DS Zero 3 and the weights are initialized empty
+        if num_params == 0 and hasattr(param, "ds_numel"):
+            num_params = param.ds_numel
+
+        all_param += num_params
+        if param.requires_grad:
+            log_info(f"trainable: {name}, num_params: {num_params}")
+            if "lm_head" in name or "embed_tokens" in name:
+                embedding_lm_head_param_count += num_params
+            else:
+                lora_param_count += num_params
+    trainable_params = embedding_lm_head_param_count + lora_param_count
+    log_info(
+        f"all params: {all_param:,d} || trainable params: {trainable_params:,d} || trainable%: {100 * trainable_params / all_param}"
+    )
+    log_info(
+        f"embedding_lm_head_param_count: {embedding_lm_head_param_count} = {embedding_lm_head_param_count * 100 / all_param} %"
+    )
+    log_info(
+        f"loara_param: {lora_param_count} = {lora_param_count * 100 / all_param} %"
+    )
+
+
+def get_max_length_config():
+    config_path = "test_axolotl.yml"
+    with open(config_path, "r") as file:
+        config_dict = yaml.safe_load(file)
+    return config_dict["sequence_len"]
+
+
+def make_parser(subparsers: argparse._SubParsersAction = None):
+    dataclass_types = (TrainingArguments, ModelConfig)
+    if subparsers is not None:
+        parser = subparsers.add_parser(
+            "dpo", help="Run the DPO training script", dataclass_types=dataclass_types
+        )
+    else:
+        parser = TrlParser(dataclass_types)
+    return parser
+
+
+def main():
+    """Format of training requests"""
+    # Prevent NCCL from using /dev/shm (shared memory) which can exhaust
+    # the small /dev/shm allocation in container environments.
+    # Must be set before the distributed process group is initialized.
+    import os as _os
+    if not _os.environ.get("NCCL_SHM_DISABLE"):
+        _os.environ["NCCL_SHM_DISABLE"] = "1"
+    if not _os.environ.get("NCCL_P2P_DISABLE"):
+        _os.environ["NCCL_P2P_DISABLE"] = "1"
+    parser = make_parser()
+    training_args, model_args = parser.parse_args_and_config()
+    train_info = json.load(open(training_args.request_path, "r"))
+    train_request = train_info["train_request"]
+
+    # check if need to run early stop or not
+    task_id = train_request["task_id"]
+    
+    # wandb_init_success = init_wandb(train_request)
+    # if not wandb_init_success:
+    #     log_info("WANDB_API_KEY is not set, do not report to wandb")
+    #     training_args.report_to = "none"    
+    # else:
+    #     log_info("WANDB_API_KEY is provided, we will report to wandb")
+    #     training_args.report_to = "wandb"
+
+    # log_info(f"Training request: {train_request}", "start")
+    # first download the dataset from the URL, save it as data.json
+    output_dir = training_args.output_dir
+    tokenizer = AutoTokenizer.from_pretrained(train_request["model_path"])
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+    # max_length = get_max_length_config()
+    # if "max_length" in train_request:
+    #     max_length = train_request["max_length"]
+    # default implementation, max_length=1024 (prompt + completion), max_prompt_length=512
+
+    train_path = os.path.join("datasets", f"dpo_train_{task_id}.json")
+    dev_path = os.path.join("datasets", f"dpo_dev_{task_id}.json")
+
+    train_ds = get_dataset(train_path, train_request["dataset_type"])
+    dev_ds = get_dataset(dev_path, train_request["dataset_type"])
+
+    log_info(f"world_size: {training_args.world_size}")
+    total_steps_per_epoch = len(train_ds) // (
+        training_args.per_device_train_batch_size
+        * training_args.gradient_accumulation_steps
+        * training_args.world_size
+    )
+
+    log_info(f"total_steps_per_epoch: {total_steps_per_epoch}")
+    # consider reducing the batch_size if it is quite big
+    # num_steps = len(train_ds) * training_args.num_train_epochs / (training_args.per_device_train_batch_size * training_args.gradient_accumulation_steps * training_args.world_size)
+    # num_steps > min_step ->
+    max_batch_size_theory = len(train_ds) / (
+        training_args.gradient_accumulation_steps
+        * training_args.world_size
+        * train_request["min_steps"]
+    )
+    max_batch_size_theory = int(max_batch_size_theory)
+    if max_batch_size_theory == 0:
+        max_batch_size_theory = 1
+
+    original_batch_size = training_args.per_device_train_batch_size
+
+    quantization_config = get_quantization_config(model_args)
+    device_string = "cuda:" + str(LOCAL_RANK)
+    
+    device_map=(
+            get_kbit_device_map()
+            if quantization_config is not None
+            else {"": device_string}
+        )
+    if len(training_args.fsdp) > 0 or is_deepspeed_zero3_enabled():
+        device_map = None
+
+
+    attn_implementation="flash_attention_2" if not training_args.disable_fa else "eager"
+    if training_args.use_attn_implementation:
+        attn_implementation = training_args.use_attn_implementation
+        log_info(f"Using {attn_implementation} as the attention implementation")
+        
+    model_kwargs = dict(
+        revision=model_args.model_revision,
+        attn_implementation=attn_implementation,
+        torch_dtype=torch.bfloat16,
+        use_cache=False if training_args.gradient_checkpointing else True,
+        device_map=device_map
+    )
+    
+    # Only add quantization_config if it's not None
+    if quantization_config is not None:
+        model_kwargs["quantization_config"] = quantization_config
+
+    log_info(f"final training_args: {training_args}")
+
+    if training_args.use_liger:
+        from liger_kernel.transformers import AutoLigerKernelForCausalLM
+
+        model_class = AutoLigerKernelForCausalLM
+    else:
+        model_class = transformers.AutoModelForCausalLM
+
+    model = model_class.from_pretrained(train_request["model_path"], **model_kwargs)
+    if len(training_args.fsdp) > 0 or is_deepspeed_zero3_enabled():
+        # set gradient checkpointing to True with use_reentrant=True for deepspeed
+        log_info("Setting gradient checkpointing to True with use_reentrant=True for deepspeed")
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': True})
+
+
+    # some model need to set the generation config or encounter the invalid generation config error
+    set_generation_config(train_request["model_name"], model)
+
+    ref_model = None
+    if "ref_model" in train_request:
+        ref_model = model_class.from_pretrained(
+            train_request["ref_model"], **model_kwargs
+        )
+        # print("load ref_model: ", train_request["ref_model"])
+
+    peft_config = get_peft_config(model_args)
+    if "lora_model" in train_request:
+        model = PeftModelForCausalLM.from_pretrained(
+            model, train_request["lora_model"], is_trainable=True, **model_kwargs
+        )
+
+    if peft_config is None:  # this is full-weight training
+        # some model need to resize the token embeddings or encounter the size mismatch error; only for full-weight models
+        resize_if_needed(train_request["model_name"], model, len(tokenizer))
+
+    # Only resize token embeddings if not using LoRA
+    # if peft_config is None:  # full-weights training
+    #    model.resize_token_embeddings(len(tokenizer))
+
+    # Check if this is the main process and create the output directory
+    if is_main_process(LOCAL_RANK):  # Only create directory on main process
+        os.makedirs(training_args.output_dir, exist_ok=True)
+        log_info(f"Created output directory: {training_args.output_dir}")
+
+    periodic_save_steps = train_request.get("periodic_save_steps", -1)
+    log_info(f"periodic_save_steps: {periodic_save_steps}")
+
+    training_args.save_only_model = True  # only save the model, not the optimizer
+
+    if training_args.gradient_checkpointing:
+        training_args.gradient_checkpointing_kwargs = {"use_reentrant": False}
+    print("train_ds.column_names: ", train_ds.column_names)
+
+    max_steps = train_request.get("max_steps", -1)
+    log_info(f"max_steps: {max_steps}")
+    
+    start_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    state = get_state()
+    state["train"]["start_train_time"] = start_time
+    if is_main_process(LOCAL_RANK):
+        set_state(state)
+    
+    total_steps_per_epoch = len(train_ds) // (
+                training_args.per_device_train_batch_size
+                * training_args.gradient_accumulation_steps
+                * training_args.world_size
+            )
+    
+    total_steps_all_epochs = total_steps_per_epoch * training_args.num_train_epochs
+    log_info(f"total_steps_per_epoch: {total_steps_per_epoch}; total_steps_all_epochs: {total_steps_all_epochs}")
+    
+    
+    success_file = os.path.join(training_args.output_dir, "success.txt")
+    # remove the success file if it exists
+    if is_main_process(LOCAL_RANK) and os.path.exists(success_file):
+        os.remove(success_file)
+    
+    checking_step = train_request["checking_step"]
+    if checking_step >= total_steps_per_epoch:
+        checking_step = total_steps_per_epoch - 2
+    
+
+    trainer = DPOTrainer(
+        model=model,
+        ref_model=ref_model,
+        args=training_args,
+        train_dataset=train_ds,
+        eval_dataset=dev_ds,
+        processing_class=tokenizer,
+        peft_config=peft_config,
+        callbacks=[
+            CustomEvalSaveCallback(
+                WhenToEvalHandler(train_request["end_time"], train_request["save_before_remaining_time"], periodic_save_steps=periodic_save_steps, steps_per_epoch=total_steps_per_epoch, max_steps=max_steps),
+                train_request["submission_dir"],
+                training_args.output_dir,
+                train_request["model_name"],
+                max_steps,
+                checking_step=checking_step,
+                total_steps_all_epochs=total_steps_all_epochs,
+                end_time=train_request["end_time"],
+                checking_mode=train_request.get("checking_mode", "none")
+            )
+        ],
+    )
+
+    # ------------------------------------------------------------------ #
+    # LR Finder for DPO — SFT-proxy strategy                              #
+    # DPOTrainer.compute_loss() needs ref_model logprobs which are        #
+    # expensive to compute in a finder loop. Instead we use a lightweight  #
+    # HF Trainer with the same model but only the 'chosen' column as a    #
+    # standard SFT objective. This gives us a valid LR range signal.      #
+    # All-ranks-parallel strategy (same as instruct), safe for DDP.       #
+    # ------------------------------------------------------------------ #
+    run_lr_finder = train_request.get("run_lr_finder", True)
+    distributed_type = train_request.get("distributed", "ddp")
+    use_deepspeed = (distributed_type == "ds")
+    # Only run LR finder on the very first training pass (checking_mode="first_time").
+    # On subsequent lr_utils-driven runs (checking_mode="second_time") and the final
+    # full run (checking_mode="none"), the LR is already determined by text_trainer.py
+    # via lr_utils — no need to re-search.
+    is_initial_run = train_request.get("checking_mode", "first_time") == "first_time"
+    run_lr_finder = run_lr_finder and is_initial_run
+
+    if run_lr_finder and not use_deepspeed:
+        # Flush cache before finder to reclaim fragmented allocations
+        import gc as _gc; _gc.collect(); torch.cuda.empty_cache()
+        log_info(
+            f"[LR Finder/DPO] Running SFT-proxy finder on {training_args.world_size} GPU(s). "
+            f"Config LR: {training_args.learning_rate:.2e}"
+        )
+        try:
+            from copy import deepcopy
+            from torch.utils.data import Dataset as TorchDataset
+
+            # Build minimal SFT dataset from 'chosen' column ----------------
+            class _ChosenSFTDataset(TorchDataset):
+                """Wraps DPO dataset exposing only the 'chosen' tokens."""
+                def __init__(self, dpo_ds):
+                    # DPOTrainer stores chosen as input_ids after collation;
+                    # raw dataset keeps them as strings. We just pass them
+                    # through to the tokenizer via a dummy Trainer.
+                    self._ds = dpo_ds
+
+                def __len__(self):
+                    return len(self._ds)
+
+                def __getitem__(self, idx):
+                    row = self._ds[idx]
+                    # DPO dataset contains 'chosen_input_ids' after processing
+                    # or 'chosen' as raw text. Use whichever is available.
+                    if "chosen_input_ids" in row:
+                        return {
+                            "input_ids": row["chosen_input_ids"],
+                            "attention_mask": row.get("chosen_attention_mask",
+                                                      [1] * len(row["chosen_input_ids"])),
+                            "labels": row["chosen_input_ids"],
+                        }
+                    else:
+                        # Tokenize on-the-fly
+                        enc = tokenizer(
+                            row.get("chosen", ""),
+                            truncation=True,
+                            max_length=training_args.max_length or 1024,
+                        )
+                        return {
+                            "input_ids": enc["input_ids"],
+                            "attention_mask": enc["attention_mask"],
+                            "labels": enc["input_ids"],
+                        }
+
+            sft_train_ds = _ChosenSFTDataset(train_ds)
+            sft_dev_ds = _ChosenSFTDataset(dev_ds)
+
+            # Minimal HF TrainingArguments for the proxy finder --------------
+            from transformers import DataCollatorForSeq2Seq
+            lr_finder_hf_args = HFTrainingArguments(
+                output_dir="/tmp/_lr_finder_dpo",
+                per_device_train_batch_size=training_args.per_device_train_batch_size,
+                gradient_checkpointing=training_args.gradient_checkpointing,
+                bf16=training_args.bf16,
+                fp16=training_args.fp16,
+                no_cuda=False,
+                report_to="none",
+            )
+            lr_finder_trainer = Trainer(
+                model=model,
+                tokenizer=tokenizer,
+                args=lr_finder_hf_args,
+                train_dataset=sft_train_ds,
+                eval_dataset=sft_dev_ds,
+                data_collator=DataCollatorForSeq2Seq(
+                    tokenizer,
+                    pad_to_multiple_of=8,
+                    return_tensors="pt",
+                    padding=True,
+                ),
+            )
+
+            min_lr = training_args.learning_rate * DPO_CONFIG_RATIO["min_lr_rate"]
+            max_lr = training_args.learning_rate * DPO_CONFIG_RATIO["max_lr_rate"]
+            use_lora = (peft_config is not None)
+
+            effective_lr, _, _, num_evals = find_lr_and_continue(
+                trainer=lr_finder_trainer,
+                start_lr=min_lr,
+                end_lr=max_lr,
+                time_budget_minutes=10.0,
+                preserve_state=True,
+                lora=use_lora,
+                # propagate gradient checkpointing into finder
+                use_gradient_checkpointing=training_args.gradient_checkpointing,
+            )
+            log_info(f"[LR Finder/DPO] Selected LR: {effective_lr:.2e} ({num_evals} evals)")
+            del lr_finder_trainer, lr_finder_hf_args
+            del sft_train_ds, sft_dev_ds
+            torch.cuda.empty_cache()
+        except torch.cuda.OutOfMemoryError:
+            log_info("[LR Finder/DPO] OOM — retrying with batch_size=1")
+            try:
+                lr_finder_hf_args.per_device_train_batch_size = 1
+                lr_finder_trainer = Trainer(
+                    model=model, tokenizer=tokenizer, args=lr_finder_hf_args,
+                    train_dataset=sft_train_ds, eval_dataset=sft_dev_ds,
+                )
+                effective_lr, _, _, _ = find_lr_and_continue(
+                    trainer=lr_finder_trainer, start_lr=min_lr, end_lr=max_lr,
+                    time_budget_minutes=10.0, preserve_state=True, lora=use_lora,
+                    # always enable gradient checkpointing on OOM retry
+                    use_gradient_checkpointing=True,
+                )
+            except Exception as e2:
+                log_info(f"[LR Finder/DPO] Retry failed: {e2} — using config LR")
+                effective_lr = training_args.learning_rate
+        except Exception as e:
+            log_info(f"[LR Finder/DPO] Failed: {e} — using config LR")
+            effective_lr = training_args.learning_rate
+
+        training_args.learning_rate = effective_lr
+        log_info(f"[LR Finder/DPO] Final LR set for training: {effective_lr:.2e}")
+        # Persist the found LR into shared state so text_trainer.py can use
+        # it as the base for lr_utils on subsequent runs.
+        try:
+            _state = get_state()
+            if "train" not in _state:
+                _state["train"] = {}
+            _state["train"]["found_lr"] = effective_lr
+            if is_main_process(LOCAL_RANK):
+                set_state(_state)
+        except Exception as _se:
+            log_info(f"[LR Finder/DPO] Could not persist found_lr to state: {_se}")
+    else:
+        if not is_initial_run:
+            log_info("[LR Finder/DPO] Skipped — non-initial run (lr_utils controls LR now)")
+        elif use_deepspeed:
+            log_info("[LR Finder/DPO] Skipped — DeepSpeed ZeRO mode")
+        else:
+            log_info("[LR Finder/DPO] Skipped — disabled via run_lr_finder=False")
+
+    # ------------------------------------------------------------------ #
+    # Post-LR-Finder cleanup (same rationale as train_instruct.py)         #
+    # ------------------------------------------------------------------ #
+    import gc as _gc
+    _gc.collect()
+    torch.cuda.empty_cache()
+    try:
+        import torch.distributed as _dist
+        if _dist.is_available() and _dist.is_initialized():
+            _dist.barrier(device_ids=[LOCAL_RANK])
+            log_info("[Post-LR-Finder/DPO] All ranks synced via barrier before DDP init.")
+    except Exception as _be:
+        log_info(f"[Post-LR-Finder/DPO] barrier skipped: {_be}")
+
+    print("Start training ...", flush=True)
+    trainer.train()
+    
+    if is_main_process(LOCAL_RANK):
+        with open(os.path.join(training_args.output_dir, "success.txt"), "w") as f:
+            f.write("Success")
+
+
+if __name__ == "__main__":
+    main()
