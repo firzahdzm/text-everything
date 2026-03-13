@@ -62,19 +62,20 @@ class CustomEvalSaveCallback(TrainerCallback):
         self.total_steps_all_epochs = total_steps_all_epochs
         self.checking_mode = checking_mode
         self.end_time = end_time
+
+        if (self.total_steps_all_epochs > 0
+                and self.checking_step >= self.total_steps_all_epochs
+                and self.checking_mode != "none"):
+            original = self.checking_step
+            self.checking_step = max(10, int(self.total_steps_all_epochs * 0.6))
+            print(f"[Adaptive] checking_step {original} >= total_steps {self.total_steps_all_epochs}, "
+                  f"clamped to {self.checking_step}", flush=True)
         
     def compute_loss(self, state: TrainerState, metrics):
         return metrics.get("eval_loss", None)
 
     def on_step_end(self, args, state: TrainerState, control: TrainerControl, **kwargs):
-        # Custom logic to decide whether to save or evaluate
-        # print(f"************* on_step_end: {state.global_step}, check eval", flush=True)
-        # TODO: implement the logic to save the model without evaluating if there is no check points --> avoid evaluating takes too much time
-        # Check if the checking_step is reached
-        # print(f"Checking the model at step: {state.global_step}, checking_step: {self.checking_step}, checking_mode: {self.checking_mode}", flush=True)
         if state.global_step == self.checking_step and self.checking_mode == "first_time":
-            # print(f"Checking the model at step: {state.global_step}", flush=True)
-            # check the time so far to estimate the training time in total 
             my_state = get_state()
             start_time_obj = datetime.datetime.strptime(my_state["train"]["start_time"], "%Y-%m-%d %H:%M:%S")
             start_train_time_obj = datetime.datetime.strptime(my_state["train"]["start_train_time"], "%Y-%m-%d %H:%M:%S")
@@ -131,8 +132,10 @@ class CustomEvalSaveCallback(TrainerCallback):
                 control.should_save = False
                 args.save_strategy = "no"
                 # save the current loss of this step to the state;
-                last_log = state.log_history[-1]
-                my_state["train"]["current_loss"] = last_log["loss"]
+                if len(state.log_history) > 0 and "loss" in state.log_history[-1]:
+                    my_state["train"]["current_loss"] = state.log_history[-1]["loss"]
+                else:
+                    my_state["train"]["current_loss"] = float("inf")
                 my_state["mode"] = "continue"
                 if n > MAX_TRIES:
                     n = MAX_TRIES
@@ -146,15 +149,15 @@ class CustomEvalSaveCallback(TrainerCallback):
                 set_state(my_state)
                 print(log_content, flush=True)            
             return control
-        # Early stop for exploration runs: if loss at step 40 is clearly worse than
+        # Early stop for exploration runs: if loss at midpoint is clearly worse than
         # current best, stop early to save time for more LR candidates
-        EARLY_STOP_STEP = 40
+        EARLY_STOP_STEP = max(5, int(self.checking_step * 0.57))  # ~57% of checking_step
         EARLY_STOP_THRESHOLD = 1.15  # stop if loss > best × 1.15
         if (state.global_step == EARLY_STOP_STEP
                 and self.checking_mode == "second_time"
                 and state.global_step < self.checking_step):
             my_state = get_state()
-            if "runs" in my_state and len(my_state["runs"]) > 0:
+            if "runs" in my_state and len(my_state["runs"]) > 0 and len(state.log_history) > 0 and "loss" in state.log_history[-1]:
                 current_loss = state.log_history[-1]["loss"]
                 current_min_loss = min(run["current_loss"] for run in my_state["runs"])
                 if current_loss > current_min_loss * EARLY_STOP_THRESHOLD:
@@ -173,7 +176,10 @@ class CustomEvalSaveCallback(TrainerCallback):
         elif state.global_step == self.checking_step and self.checking_mode == "second_time": # at second time, we don't estimate the training time again, just save the current_loss
             log_content = f"Checking the model at step: {state.global_step} where check_mode=second_time"            
             my_state = get_state()
-            current_loss = state.log_history[-1]["loss"]
+            if len(state.log_history) > 0 and "loss" in state.log_history[-1]:
+                current_loss = state.log_history[-1]["loss"]
+            else:
+                current_loss = float("inf")
             my_state["train"]["current_loss"] = current_loss
                 
             control.should_training_stop = True

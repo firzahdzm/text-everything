@@ -47,14 +47,12 @@ import lr_utils
 from config_pair import REG_RATIO
 
 def run_cmd_with_log(cmd: str, log_file_path: str, env_vars: dict = None):
-    # print(f"Running command: {cmd}", flush=True)
     with open(log_file_path, "w") as log_file:
-        # Prepare environment variables
         process_env = os.environ.copy()
+        process_env["DS_ACCELERATOR"] = "cuda"
         if env_vars:
             process_env.update(env_vars)
 
-        # Run the command, capturing stdout and stderr
         process = subprocess.Popen(
             cmd,
             shell=True,
@@ -65,16 +63,13 @@ def run_cmd_with_log(cmd: str, log_file_path: str, env_vars: dict = None):
             env=process_env,
         )
 
-        # Stream output to both console and log file
         for line in process.stdout:
             print(line, end="", flush=True)
             log_file.write(line)
             log_file.flush()
 
-        # Wait for the process to complete
         return_code = process.wait()
 
-        # Log the return code
         log_file.write(f"\nProcess completed with return code: {return_code}\n")
 
 
@@ -152,8 +147,7 @@ def run_training(
             f"************* Training attempt {i+1}/{retries} for task {task_id}*************",
             flush=True,
         )
-        if i > 0:  # there was something wrong so we will reduce the batch_size
-            # first check if the training is OOM
+        if i > 0:
             if os.path.exists(log_path):
                 error_type = get_error_type(log_path)
                 if error_type == OOM_ERROR:
@@ -172,21 +166,17 @@ def run_training(
                             "per_device_train_batch_size",
                             str(new_batch_size),
                         )
-                        # print(f"New train command: {train_cmd}", flush=True)
                     else:
                         print(f"batch size is 1, cannot reduce further", flush=True)
                         if task_type == TaskType.GRPOTASK.value:
-                            # disable vllm
                             train_cmd = replace_args_in_cmd(
                                 train_cmd, "use_vllm", "False"
                             )
-                            # print(f"disable VLLM {train_cmd}", flush=True)
                 elif error_type == VLLM_OOM_ERROR:
                     if task_type == TaskType.GRPOTASK.value:
                         print(f"VLLM OOM error, disable VLLM", flush=True)
                         train_cmd = replace_args_in_cmd(train_cmd, "use_vllm", "False")
 
-        # empty the log file if it exists
         if os.path.exists(log_path):
             with open(log_path, "w") as f:
                 f.write("STARTING TRAINING")
@@ -198,7 +188,6 @@ def run_training(
         }
 
         run_cmd_with_log(train_cmd, log_path, env_vars=training_env_vars)
-        # check if training is successfully here so we can break the loop; if output_dir contains file: "successs.txt" return true
         output_dir = extract_value_from_cmd(train_cmd, "output_dir")
         if os.path.exists(os.path.join(output_dir, "success.txt")):
             return True
@@ -324,7 +313,7 @@ def main():
 
     end_time = datetime.now(timezone.utc) + timedelta(
         hours=args.hours_to_complete - 3 / 60
-    )  # assume that 3 minutes to go this far
+    )
     end_time = end_time.strftime("%Y-%m-%d %H:%M:%S")
     print("end_time: ", end_time, flush=True)
 
@@ -340,12 +329,10 @@ def main():
             "pip uninstall -y transformers && pip install transformers==4.55.0",
             os.path.join(ds_folder, f"upgrade_transformers.log"),
         )
-        # upgrade deepspeed
         run_cmd_with_log(
             "pip uninstall -y deepspeed && pip install deepspeed==0.17.4",
             os.path.join(ds_folder, f"upgrade_deepspeed.log"),
         )
-        # install kernel
         run_cmd_with_log(
             "pip install kernels==0.9.0", os.path.join(ds_folder, f"install_kernel.log")
         )
@@ -408,20 +395,18 @@ def main():
     train_success = False
     state = get_state()
     state = {}
-    set_state(state) # reset first
+    set_state(state)
     state["mode"] = "initial"
-    # at first the state is always running the train_cmd
 
     set_state(state)
-    # TODO Run something magic here
     count = 0
     while True:
         state = get_state()
-        train_cmd = original_train_cmd  # will replace based on the state later
+        train_cmd = original_train_cmd
         c_train_info = copy.deepcopy(train_info)
         final_output_dir = None
         if args.task_type == TaskType.GRPOTASK.value:
-            state["mode"] = "finish" # do not run this for GRPO task
+            state["mode"] = "finish"
             c_train_info["train_request"]["checking_mode"] = "none"
         else:
             if state["mode"] == "initial":
@@ -431,12 +416,12 @@ def main():
             elif state["mode"] == "continue":
                 c_train_info["train_request"]["checking_mode"] = "second_time"
                 n_runs = state["next_runs"]
-                if "lrs" not in state: # first time of continue
+                if "lrs" not in state:
                     found_lr = state["train"].get("found_lr")
                     current_lr = float(found_lr if found_lr is not None else state["train"]["lr"])
                     print(f"[text_trainer] Bayesian LR search base LR: {current_lr:.4e} "
                           f"({'from LR finder' if found_lr is not None else 'from config'})", flush=True)
-                    state["lrs"] = [current_lr]  # start with baseline only
+                    state["lrs"] = [current_lr]
                     state["base_lr"] = current_lr
                     state["runs"] = []
                 
@@ -444,8 +429,6 @@ def main():
                 state["runs"].append(state["train"].copy())
                 delete_poor_checkpoints(state["runs"])
 
-                # Adaptive exploration: if early-stopped runs saved time,
-                # use that budget for extra LR candidates
                 checking_step = c_train_info["train_request"].get("checking_step", 70)
                 last_run = state["runs"][-1]
                 if "stopped_at_step" in last_run:
@@ -473,7 +456,7 @@ def main():
                     index = len(state["runs"])
                     train_cmd = replace_args_in_cmd(train_cmd, "learning_rate", str(next_lr))
                     train_cmd = replace_args_in_cmd(train_cmd, "warmup_steps", "0")
-                else: # the final run
+                else:
                     # first find from runs the best loss
                     c_train_info["train_request"]["checking_mode"] = "none"
                     index = np.argmin([run["current_loss"] for run in state["runs"]])
