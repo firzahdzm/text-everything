@@ -188,7 +188,6 @@ def get_run_cmd(config: dict, gpu_nums: int):
 
     start_cmd = "python"
     run_type = config["distributed"]
-    # if gpu_nums > 1 and run_type == "ddp":
     gpu_nums = get_gpu_count()
     start_cmd = f"torchrun --nproc_per_node={gpu_nums}"
     if run_type == "ds":
@@ -305,7 +304,7 @@ def get_training_json(train_info: dict) -> dict:
             run_config["batch_size"] = 16
             if (
                 model_name == "unsloth/gemma-2-9b-it"
-            ):  # encounter OOM error with batch_size 12
+            ):
                 run_config["batch_size"] = 8
         elif config["label"] == "9_12_b":
             run_config["batch_size"] = 16
@@ -314,7 +313,7 @@ def get_training_json(train_info: dict) -> dict:
         elif config["label"] == "15_20_b":
             run_config["batch_size"] = 2
         elif config["label"] == "20_40_b":
-            run_config["batch_size"] = 16  # this is high because we use 4bit
+            run_config["batch_size"] = 16 
         elif config["label"] == "40_80_b":
             run_config["batch_size"] = 2
 

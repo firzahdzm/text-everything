@@ -115,7 +115,7 @@ def get_config(param_nums: int) -> dict:
         }
     if param_nums < 4_000_000_000 and param_nums > 1_330_000_000:
         result["gpu_count"] = 2
-    if param_nums > 13_330_000_000: # 8 GPUs for 13.3B
+    if param_nums > 13_330_000_000:
         result["gpu_count"] = 8
     return result
 
@@ -217,7 +217,6 @@ def get_training_json(train_info: dict) -> dict:
         run_config["gradient_accumulation_steps"] = min(4, int(64 / total_batch_size))
     
     if train_info["find_lk_lr"]:
-        # get lr from lrs_lookup.py
         lr = get_dpo_lr(model_name)
         if lr is not None:
             print(f"Using lr from lk: {lr}", flush=True)
@@ -235,7 +234,6 @@ def get_training_json(train_info: dict) -> dict:
     train_request["adjust_batch_size"] = False
     train_request["periodic_save_steps"] = 500
     train_request["checking_step"] = 80
-    # Pass distributed type and LR finder flag
     train_request["distributed"] = run_config.get("distributed", "ddp")
     train_request["run_lr_finder"] = run_config.get("distributed", "ddp") != "ds"
 

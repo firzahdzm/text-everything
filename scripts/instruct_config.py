@@ -217,16 +217,10 @@ def get_training_json(train_info: dict) -> dict:
         ),
     }
 
-    # there are models that do not support packing, so we need to check if the model supports packing
     if run_config["disable_fa"] == "True" or model_architecture.strip().lower() in [
         "optforcausallm"
     ]:
         run_config["packing"] = "False"
-
-    # data_size = get_data_size(train_info["request_path"])
-
-    # if run_config["disable_fa"]: # if FA is not usable
-    #     run_config["batch_size"] = run_config["batch_size"] * 2
 
     if model_name in FIXED_BS_CONFIG:
         run_config["batch_size"] = FIXED_BS_CONFIG[model_name]["batch_size"]
@@ -262,10 +256,9 @@ def get_training_json(train_info: dict) -> dict:
         run_config["gradient_accumulation_steps"] = int(64 / data_per_step)
 
     if model_architecture.strip().lower() in ["gptossforcausallm"]:
-        run_config["use_lora"] = False  # currently, gptoss does not support lora
+        run_config["use_lora"] = False
 
     if train_info["find_lk_lr"]:
-        # get lr from lrs_lookup.py
         lr = get_instruct_lr(model_name)
         if lr is not None:
             print(f"Using lr from lk: {lr}", flush=True)
@@ -291,10 +284,7 @@ def get_training_json(train_info: dict) -> dict:
             int(train_info["hours_to_complete"] * 70), train_request["min_steps"]
         )
 
-    # Pass distributed type and LR finder flag to train_request so
-    # train_instruct.py can decide whether to run the finder.
     train_request["distributed"] = run_config.get("distributed", "ddp")
-    # Disable LR finder for DeepSpeed (ZeRO incompatible with manual param ops)
     train_request["run_lr_finder"] = run_config.get("distributed", "ddp") != "ds"
 
     return {"train_request": train_request, "run_cmd": run_cmd}
