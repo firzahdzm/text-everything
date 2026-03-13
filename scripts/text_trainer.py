@@ -432,16 +432,12 @@ def main():
                 c_train_info["train_request"]["checking_mode"] = "second_time"
                 n_runs = state["next_runs"]
                 if "lrs" not in state: # first time of continue
-                    # Prefer the LR found by lr_finder_les over the raw config LR.
-                    # train_instruct.py / train_dpo.py write "found_lr" into state
-                    # after a successful LR finder run.  Fall back to the cmd LR
-                    # if the finder was skipped or failed.
                     found_lr = state["train"].get("found_lr")
                     current_lr = float(found_lr if found_lr is not None else state["train"]["lr"])
-                    print(f"[text_trainer] lr_utils base LR: {current_lr:.4e} "
+                    print(f"[text_trainer] Bayesian LR search base LR: {current_lr:.4e} "
                           f"({'from LR finder' if found_lr is not None else 'from config'})", flush=True)
-                    state["lrs"] = lr_utils.smart_extend_learning_rates(current_lr, n_runs, log_range=get_log_scale(args.task_type))
-                    assert len(state["lrs"]) == n_runs, f"Number of learning rates {state['lrs']} should be equal to number of runs {n_runs}"
+                    state["lrs"] = [current_lr]  # start with baseline only
+                    state["base_lr"] = current_lr
                     state["runs"] = []
                 
                 set_state(state)
@@ -459,28 +455,23 @@ def main():
                           f"total saved: {state['saved_steps']}/{checking_step}", flush=True)
 
                 if state.get("saved_steps", 0) >= checking_step and n_runs < 9:
-                    # Enough time saved for 1 extra run — generate new LR candidate
-                    import math
-                    PHI = (1 + math.sqrt(5)) / 2
-                    log_range = get_log_scale(args.task_type)
-                    new_idx = len(state["lrs"])
-                    cycle = (new_idx - 1) // 2
-                    sign = 1 if new_idx % 2 == 1 else -1
-                    step = log_range / (PHI ** cycle)
-                    found_lr = state["train"].get("found_lr")
-                    base_lr = float(found_lr if found_lr is not None else state["train"]["lr"])
-                    new_lr = base_lr * (10 ** (sign * step))
-                    state["lrs"].append(new_lr)
                     state["next_runs"] += 1
                     n_runs = state["next_runs"]
                     state["saved_steps"] -= checking_step
-                    print(f"[Adaptive] Added extra LR candidate: {new_lr:.4e} "
-                          f"(total runs now: {n_runs})", flush=True)
+                    print(f"[Adaptive] Time budget for extra run, total runs now: {n_runs}", flush=True)
 
                 if len(state["runs"]) < n_runs:
+                    # Use Bayesian optimization to suggest the next LR
+                    from bayesian_lr import suggest_next_lr
+                    observations = [(state["lrs"][i], state["runs"][i]["current_loss"])
+                                    for i in range(len(state["runs"]))]
+                    log_range = get_log_scale(args.task_type)
+                    next_lr = suggest_next_lr(observations, log_range, state["base_lr"])
+                    state["lrs"].append(next_lr)
+                    print(f"[Bayesian] Suggested next LR: {next_lr:.4e} "
+                          f"(based on {len(observations)} observations)", flush=True)
                     index = len(state["runs"])
-                    current_lr = state["lrs"][index]
-                    train_cmd = replace_args_in_cmd(train_cmd, "learning_rate", str(state["lrs"][index]))
+                    train_cmd = replace_args_in_cmd(train_cmd, "learning_rate", str(next_lr))
                     train_cmd = replace_args_in_cmd(train_cmd, "warmup_steps", "0")
                 else: # the final run
                     # first find from runs the best loss
