@@ -51,6 +51,10 @@ def run_cmd_with_log(cmd: str, log_file_path: str, env_vars: dict = None):
     with open(log_file_path, "w") as log_file:
         # Prepare environment variables
         process_env = os.environ.copy()
+        # Force DeepSpeed to use CUDA instead of auto-detect.
+        # Auto-detect fails on sequential subprocess runs because Triton's
+        # driver query returns "0 active drivers" after first process exits.
+        process_env["DS_ACCELERATOR"] = "cuda"
         if env_vars:
             process_env.update(env_vars)
 
