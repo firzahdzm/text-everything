@@ -132,8 +132,10 @@ class CustomEvalSaveCallback(TrainerCallback):
                 control.should_save = False
                 args.save_strategy = "no"
                 # save the current loss of this step to the state;
-                last_log = state.log_history[-1]
-                my_state["train"]["current_loss"] = last_log["loss"]
+                if len(state.log_history) > 0 and "loss" in state.log_history[-1]:
+                    my_state["train"]["current_loss"] = state.log_history[-1]["loss"]
+                else:
+                    my_state["train"]["current_loss"] = float("inf")
                 my_state["mode"] = "continue"
                 if n > MAX_TRIES:
                     n = MAX_TRIES
@@ -155,7 +157,7 @@ class CustomEvalSaveCallback(TrainerCallback):
                 and self.checking_mode == "second_time"
                 and state.global_step < self.checking_step):
             my_state = get_state()
-            if "runs" in my_state and len(my_state["runs"]) > 0:
+            if "runs" in my_state and len(my_state["runs"]) > 0 and len(state.log_history) > 0 and "loss" in state.log_history[-1]:
                 current_loss = state.log_history[-1]["loss"]
                 current_min_loss = min(run["current_loss"] for run in my_state["runs"])
                 if current_loss > current_min_loss * EARLY_STOP_THRESHOLD:
@@ -174,7 +176,10 @@ class CustomEvalSaveCallback(TrainerCallback):
         elif state.global_step == self.checking_step and self.checking_mode == "second_time": # at second time, we don't estimate the training time again, just save the current_loss
             log_content = f"Checking the model at step: {state.global_step} where check_mode=second_time"            
             my_state = get_state()
-            current_loss = state.log_history[-1]["loss"]
+            if len(state.log_history) > 0 and "loss" in state.log_history[-1]:
+                current_loss = state.log_history[-1]["loss"]
+            else:
+                current_loss = float("inf")
             my_state["train"]["current_loss"] = current_loss
                 
             control.should_training_stop = True
