@@ -1,15 +1,15 @@
 GRPO_CONFIG_RATIO = {
-    "min_lr_rate": 0.1,
+    "min_lr_rate": 0.05,
     "max_lr_rate": 5.0,
 }
 
 DPO_CONFIG_RATIO = {
-    "min_lr_rate": 0.1,
+    "min_lr_rate": 0.05,
     "max_lr_rate": 5.0,
 }
 
 INSTRUCT_CONFIG_RATIO = {
-    "min_lr_rate": 0.1,
+    "min_lr_rate": 0.05,
     "max_lr_rate": 5.0,
 }
 

@@ -244,7 +244,7 @@ def find_lr_and_continue(
 
     main_time_budget = time_budget_seconds * 0.8
     max_evaluations = int(main_time_budget / (time_per_step * 5))
-    max_evaluations = min(max(10, max_evaluations), 30)
+    max_evaluations = min(max(10, max_evaluations), 50)
 
     if is_main_rank:
         logger.info(f"[LR Finder] Planning up to {max_evaluations} evaluations")
