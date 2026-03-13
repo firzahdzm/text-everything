@@ -146,7 +146,29 @@ class CustomEvalSaveCallback(TrainerCallback):
                 set_state(my_state)
                 print(log_content, flush=True)            
             return control
-    
+        # Early stop for exploration runs: if loss at step 40 is clearly worse than
+        # current best, stop early to save time for more LR candidates
+        EARLY_STOP_STEP = 40
+        EARLY_STOP_THRESHOLD = 1.15  # stop if loss > best × 1.15
+        if (state.global_step == EARLY_STOP_STEP
+                and self.checking_mode == "second_time"
+                and state.global_step < self.checking_step):
+            my_state = get_state()
+            if "runs" in my_state and len(my_state["runs"]) > 0:
+                current_loss = state.log_history[-1]["loss"]
+                current_min_loss = min(run["current_loss"] for run in my_state["runs"])
+                if current_loss > current_min_loss * EARLY_STOP_THRESHOLD:
+                    print(f"[Early Stop] Step {state.global_step}: loss {current_loss:.4f} > "
+                          f"best {current_min_loss:.4f} x {EARLY_STOP_THRESHOLD} = "
+                          f"{current_min_loss * EARLY_STOP_THRESHOLD:.4f}. Stopping early.", flush=True)
+                    my_state["train"]["current_loss"] = current_loss
+                    control.should_training_stop = True
+                    control.should_save = False
+                    args.save_strategy = "no"
+                    if is_main_process(LOCAL_RANK):
+                        set_state(my_state)
+                    return control
+
         elif state.global_step == self.checking_step and self.checking_mode == "second_time": # at second time, we don't estimate the training time again, just save the current_loss
             log_content = f"Checking the model at step: {state.global_step} where check_mode=second_time"            
             my_state = get_state()

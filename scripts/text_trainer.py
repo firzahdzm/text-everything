@@ -243,10 +243,10 @@ def delete_poor_checkpoints(train_runs: list[dict]):
 
 def get_log_scale(task_type: str):
     log_scale_map = {
-        TaskType.INSTRUCTTEXTTASK.value: 0.18,
-        TaskType.DPOTASK.value: 0.18,
-        TaskType.GRPOTASK.value: 0.2,
-        TaskType.CHATTASK.value: 0.18,
+        TaskType.INSTRUCTTEXTTASK.value: 0.35,
+        TaskType.DPOTASK.value: 0.35,
+        TaskType.GRPOTASK.value: 0.35,
+        TaskType.CHATTASK.value: 0.35,
     }
     return log_scale_map[task_type]
 
@@ -426,6 +426,7 @@ def main():
         else:
             if state["mode"] == "initial":
                 c_train_info["train_request"]["checking_mode"] = "first_time"
+                train_cmd = replace_args_in_cmd(train_cmd, "warmup_steps", "0")
                 
             elif state["mode"] == "continue":
                 c_train_info["train_request"]["checking_mode"] = "second_time"
@@ -450,6 +451,7 @@ def main():
                     index = len(state["runs"])
                     current_lr = state["lrs"][index]
                     train_cmd = replace_args_in_cmd(train_cmd, "learning_rate", str(state["lrs"][index]))
+                    train_cmd = replace_args_in_cmd(train_cmd, "warmup_steps", "0")
                 else: # the final run
                     # first find from runs the best loss
                     c_train_info["train_request"]["checking_mode"] = "none"
